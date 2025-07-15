@@ -1,18 +1,34 @@
-# AWS Auto Scaling Group with ELB and Additional EC2 Instances Setup Guide
+# AWS Auto Scaling Group with ELB, ElastiCache, Aurora RDS, and EFS Setup Guide
 
-This guide demonstrates how to create an AWS Auto Scaling Group (ASG) with 4 EC2 instances connected to an Application Load Balancer (ALB), plus 2 additional standalone EC2 instances added to the same target group using existing VPC infrastructure.
+This guide demonstrates how to create a complete AWS infrastructure including:
+- Auto Scaling Group (ASG) with 4 EC2 instances connected to an Application Load Balancer (ALB)
+- 2 additional standalone EC2 instances added to the same target group
+- ElastiCache Redis cluster for caching
+- Aurora RDS cluster created from snapshot for database
+- EFS file system with provisioned throughput for shared storage
 
 ## Architecture Overview
 
 ```
 Existing VPC
        |
-Application Load Balancer (Public Subnets)
-       |
-Target Group
-   /       \
-ASG (4 instances)  +  Manual EC2 (2 instances)
-      (Private Subnets)
+┌─────────────────────────────────────────────────┐
+│  Application Load Balancer (Public Subnets)     │
+└─────────────────┬───────────────────────────────┘
+                  │
+┌─────────────────┴───────────────────────────────┐
+│            Target Group                        │
+│        /              \                        │
+│  ASG (4 instances) + Manual EC2 (2 instances)  │
+│           (Private Subnets)                    │
+└─────────────────────────────────────────────────┘
+                  │
+    ┌─────────────┼─────────────┐
+    │             │             │
+┌───▼───┐   ┌─────▼─────┐   ┌───▼───┐
+│  EFS  │   │ElastiCache│   │Aurora │
+│       │   │   Redis   │   │  RDS  │
+└───────┘   └───────────┘   └───────┘
 ```
 
 ## Prerequisites
@@ -136,6 +152,81 @@ resource "aws_security_group" "ec2" {
   
   tags = {
     Name = "${var.project_name}-ec2-sg"
+  }
+}
+
+# Security Group for RDS Aurora
+resource "aws_security_group" "rds" {
+  name        = "${var.project_name}-rds-sg"
+  description = "Security group for RDS Aurora cluster"
+  vpc_id      = data.aws_vpc.existing.id
+  
+  ingress {
+    from_port       = 3306
+    to_port         = 3306
+    protocol        = "tcp"
+    security_groups = [aws_security_group.ec2.id]
+  }
+  
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  
+  tags = {
+    Name = "${var.project_name}-rds-sg"
+  }
+}
+
+# Security Group for ElastiCache
+resource "aws_security_group" "elasticache" {
+  name        = "${var.project_name}-elasticache-sg"
+  description = "Security group for ElastiCache Redis cluster"
+  vpc_id      = data.aws_vpc.existing.id
+  
+  ingress {
+    from_port       = 6379
+    to_port         = 6379
+    protocol        = "tcp"
+    security_groups = [aws_security_group.ec2.id]
+  }
+  
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  
+  tags = {
+    Name = "${var.project_name}-elasticache-sg"
+  }
+}
+
+# Security Group for EFS
+resource "aws_security_group" "efs" {
+  name        = "${var.project_name}-efs-sg"
+  description = "Security group for EFS file system"
+  vpc_id      = data.aws_vpc.existing.id
+  
+  ingress {
+    from_port       = 2049
+    to_port         = 2049
+    protocol        = "tcp"
+    security_groups = [aws_security_group.ec2.id]
+  }
+  
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  
+  tags = {
+    Name = "${var.project_name}-efs-sg"
   }
 }
 
@@ -319,6 +410,154 @@ resource "aws_cloudwatch_metric_alarm" "cpu_low" {
     AutoScalingGroupName = aws_autoscaling_group.main.name
   }
 }
+
+# RDS Subnet Group
+resource "aws_db_subnet_group" "main" {
+  name       = "${var.project_name}-db-subnet-group"
+  subnet_ids = var.private_subnet_ids
+  
+  tags = {
+    Name = "${var.project_name}-db-subnet-group"
+  }
+}
+
+# Aurora RDS Cluster from Snapshot
+resource "aws_rds_cluster" "aurora" {
+  cluster_identifier      = "${var.project_name}-aurora-cluster"
+  engine                 = "aurora-mysql"
+  engine_version         = var.aurora_engine_version
+  database_name          = var.database_name
+  master_username        = var.database_username
+  master_password        = var.database_password
+  backup_retention_period = 7
+  preferred_backup_window = "07:00-09:00"
+  preferred_maintenance_window = "sun:05:00-sun:06:00"
+  
+  # Create from snapshot
+  snapshot_identifier = var.rds_snapshot_identifier
+  
+  vpc_security_group_ids = [aws_security_group.rds.id]
+  db_subnet_group_name   = aws_db_subnet_group.main.name
+  
+  storage_encrypted = true
+  
+  skip_final_snapshot = false
+  final_snapshot_identifier = "${var.project_name}-aurora-final-snapshot-${formatdate("YYYY-MM-DD-hhmm", timestamp())}"
+  
+  tags = {
+    Name = "${var.project_name}-aurora-cluster"
+  }
+}
+
+# Aurora RDS Instance
+resource "aws_rds_cluster_instance" "aurora_instance" {
+  count              = var.aurora_instance_count
+  identifier         = "${var.project_name}-aurora-instance-${count.index + 1}"
+  cluster_identifier = aws_rds_cluster.aurora.id
+  instance_class     = var.aurora_instance_class
+  engine             = aws_rds_cluster.aurora.engine
+  engine_version     = aws_rds_cluster.aurora.engine_version
+  
+  performance_insights_enabled = true
+  monitoring_interval = 60
+  
+  tags = {
+    Name = "${var.project_name}-aurora-instance-${count.index + 1}"
+  }
+}
+
+# ElastiCache Subnet Group
+resource "aws_elasticache_subnet_group" "main" {
+  name       = "${var.project_name}-cache-subnet-group"
+  subnet_ids = var.private_subnet_ids
+  
+  tags = {
+    Name = "${var.project_name}-cache-subnet-group"
+  }
+}
+
+# ElastiCache Redis Cluster
+resource "aws_elasticache_replication_group" "redis" {
+  replication_group_id       = "${var.project_name}-redis"
+  description                = "Redis cluster for ${var.project_name}"
+  
+  node_type                  = var.redis_node_type
+  port                       = 6379
+  parameter_group_name       = "default.redis7"
+  
+  num_cache_clusters         = var.redis_num_cache_nodes
+  
+  engine_version             = var.redis_engine_version
+  
+  subnet_group_name          = aws_elasticache_subnet_group.main.name
+  security_group_ids         = [aws_security_group.elasticache.id]
+  
+  at_rest_encryption_enabled = true
+  transit_encryption_enabled = true
+  
+  maintenance_window         = "sun:05:00-sun:06:00"
+  snapshot_retention_limit   = 5
+  snapshot_window           = "03:00-05:00"
+  
+  automatic_failover_enabled = var.redis_num_cache_nodes > 1 ? true : false
+  
+  tags = {
+    Name = "${var.project_name}-redis"
+  }
+}
+
+# EFS File System
+resource "aws_efs_file_system" "main" {
+  creation_token   = "${var.project_name}-efs"
+  performance_mode = "generalPurpose"
+  throughput_mode  = "provisioned"
+  provisioned_throughput_in_mibps = var.efs_provisioned_throughput
+  
+  encrypted = true
+  
+  lifecycle_policy {
+    transition_to_ia = "AFTER_30_DAYS"
+  }
+  
+  lifecycle_policy {
+    transition_to_primary_storage_class = "AFTER_1_ACCESS"
+  }
+  
+  tags = {
+    Name = "${var.project_name}-efs"
+  }
+}
+
+# EFS Mount Targets
+resource "aws_efs_mount_target" "main" {
+  count           = length(var.private_subnet_ids)
+  file_system_id  = aws_efs_file_system.main.id
+  subnet_id       = var.private_subnet_ids[count.index]
+  security_groups = [aws_security_group.efs.id]
+}
+
+# EFS Access Point
+resource "aws_efs_access_point" "main" {
+  file_system_id = aws_efs_file_system.main.id
+  
+  posix_user {
+    gid = 1001
+    uid = 1001
+  }
+  
+  root_directory {
+    path = "/app"
+    creation_info {
+      owner_gid   = 1001
+      owner_uid   = 1001
+      permissions = "755"
+    }
+  }
+  
+  tags = {
+    Name = "${var.project_name}-efs-access-point"
+  }
+}
 ```
 
 ### variables.tf
@@ -372,6 +611,74 @@ variable "key_pair_name" {
   description = "Name of the AWS key pair"
   type        = string
 }
+
+# Aurora RDS Variables
+variable "rds_snapshot_identifier" {
+  description = "Identifier of the RDS snapshot to restore from"
+  type        = string
+}
+
+variable "database_name" {
+  description = "Name of the database"
+  type        = string
+  default     = "myapp"
+}
+
+variable "database_username" {
+  description = "Master username for the database"
+  type        = string
+  default     = "admin"
+}
+
+variable "database_password" {
+  description = "Master password for the database"
+  type        = string
+  sensitive   = true
+}
+
+variable "aurora_engine_version" {
+  description = "Aurora MySQL engine version"
+  type        = string
+  default     = "8.0.mysql_aurora.3.02.0"
+}
+
+variable "aurora_instance_class" {
+  description = "Instance class for Aurora instances"
+  type        = string
+  default     = "db.r6g.large"
+}
+
+variable "aurora_instance_count" {
+  description = "Number of Aurora instances"
+  type        = number
+  default     = 2
+}
+
+# ElastiCache Variables
+variable "redis_node_type" {
+  description = "Node type for Redis cluster"
+  type        = string
+  default     = "cache.r6g.large"
+}
+
+variable "redis_num_cache_nodes" {
+  description = "Number of cache nodes in the Redis cluster"
+  type        = number
+  default     = 2
+}
+
+variable "redis_engine_version" {
+  description = "Redis engine version"
+  type        = string
+  default     = "7.0"
+}
+
+# EFS Variables
+variable "efs_provisioned_throughput" {
+  description = "Provisioned throughput for EFS in MiB/s"
+  type        = number
+  default     = 100
+}
 ```
 
 ### terraform.tfvars (example)
@@ -389,6 +696,19 @@ private_subnet_ids = [
 key_pair_name = "my-key-pair"
 project_name = "my-asg-elb"
 aws_region = "us-east-1"
+
+# RDS Configuration
+rds_snapshot_identifier = "aurora-cluster-snapshot-2024-01-01"
+database_password = "YourSecurePassword123!"
+database_username = "admin"
+database_name = "myapp"
+
+# ElastiCache Configuration
+redis_node_type = "cache.r6g.large"
+redis_num_cache_nodes = 2
+
+# EFS Configuration
+efs_provisioned_throughput = 100
 ```
 
 ### outputs.tf
@@ -417,34 +737,150 @@ output "vpc_id" {
   description = "ID of the VPC"
   value       = data.aws_vpc.existing.id
 }
+
+output "aurora_cluster_endpoint" {
+  description = "Aurora cluster endpoint"
+  value       = aws_rds_cluster.aurora.endpoint
+}
+
+output "aurora_cluster_reader_endpoint" {
+  description = "Aurora cluster reader endpoint"
+  value       = aws_rds_cluster.aurora.reader_endpoint
+}
+
+output "redis_cluster_endpoint" {
+  description = "Redis cluster endpoint"
+  value       = aws_elasticache_replication_group.redis.configuration_endpoint_address
+}
+
+output "redis_cluster_port" {
+  description = "Redis cluster port"
+  value       = aws_elasticache_replication_group.redis.port
+}
+
+output "efs_file_system_id" {
+  description = "EFS file system ID"
+  value       = aws_efs_file_system.main.id
+}
+
+output "efs_mount_target_dns_names" {
+  description = "EFS mount target DNS names"
+  value       = aws_efs_mount_target.main[*].dns_name
+}
+
+output "efs_access_point_id" {
+  description = "EFS access point ID"
+  value       = aws_efs_access_point.main.id
+}
 ```
 
 ### user-data.sh
 ```bash
 #!/bin/bash
 yum update -y
-yum install -y httpd
+
+# Install required packages
+yum install -y httpd amazon-efs-utils mysql redis
+
+# Start and enable httpd
 systemctl start httpd
 systemctl enable httpd
+
+# Install AWS CLI v2 if not present
+if ! command -v aws &> /dev/null; then
+    curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+    unzip awscliv2.zip
+    ./aws/install
+    rm -rf aws awscliv2.zip
+fi
+
+# Get instance metadata
+INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
+AZ=$(curl -s http://169.254.169.254/latest/meta-data/placement/availability-zone)
+INSTANCE_TYPE=$(curl -s http://169.254.169.254/latest/meta-data/instance-type)
+REGION=$(curl -s http://169.254.169.254/latest/meta-data/placement/region)
+
+# Get EFS file system ID from tags (you'll need to update this with actual EFS ID)
+# Or you can pass it as a parameter
+EFS_ID="fs-XXXXXXXXX"  # Update this with your EFS ID
+
+# Create mount point and mount EFS
+mkdir -p /mnt/efs
+echo "$EFS_ID.efs.$REGION.amazonaws.com:/ /mnt/efs efs defaults,_netdev,tls" >> /etc/fstab
+mount -a
+
+# Create app directory on EFS if it doesn't exist
+mkdir -p /mnt/efs/app
 
 # Create a simple HTML page
 cat > /var/www/html/index.html << EOF
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Load Balanced Instance</title>
+    <title>Complete Infrastructure Instance</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; }
+        .info-box { background: #f0f0f0; padding: 10px; margin: 10px 0; border-radius: 5px; }
+        .service { display: inline-block; margin: 10px; padding: 15px; border: 1px solid #ccc; border-radius: 5px; }
+    </style>
 </head>
 <body>
     <h1>Hello from $(hostname -f)</h1>
-    <p>Instance ID: $(curl -s http://169.254.169.254/latest/meta-data/instance-id)</p>
-    <p>Availability Zone: $(curl -s http://169.254.169.254/latest/meta-data/placement/availability-zone)</p>
-    <p>Instance Type: $(curl -s http://169.254.169.254/latest/meta-data/instance-type)</p>
+    
+    <div class="info-box">
+        <h2>Instance Information</h2>
+        <p><strong>Instance ID:</strong> $INSTANCE_ID</p>
+        <p><strong>Availability Zone:</strong> $AZ</p>
+        <p><strong>Instance Type:</strong> $INSTANCE_TYPE</p>
+        <p><strong>Region:</strong> $REGION</p>
+    </div>
+    
+    <div class="info-box">
+        <h2>Available Services</h2>
+        <div class="service">
+            <h3>🗄️ Aurora MySQL</h3>
+            <p>High-performance database cluster</p>
+        </div>
+        <div class="service">
+            <h3>📊 ElastiCache Redis</h3>
+            <p>In-memory caching service</p>
+        </div>
+        <div class="service">
+            <h3>📁 EFS</h3>
+            <p>Shared file system</p>
+            <p>Mounted at: /mnt/efs</p>
+        </div>
+        <div class="service">
+            <h3>⚖️ Application Load Balancer</h3>
+            <p>Distributing traffic across instances</p>
+        </div>
+    </div>
+    
+    <div class="info-box">
+        <h2>Health Check</h2>
+        <p>Status: ✅ Healthy</p>
+        <p>Last Updated: $(date)</p>
+    </div>
 </body>
 </html>
 EOF
 
+# Create a simple status check script
+cat > /var/www/html/health << EOF
+#!/bin/bash
+echo "OK"
+EOF
+chmod +x /var/www/html/health
+
+# Set proper permissions
+chown -R apache:apache /var/www/html/
+chmod -R 755 /var/www/html/
+
 # Restart httpd to ensure changes take effect
 systemctl restart httpd
+
+# Log completion
+echo "$(date): User data script completed successfully" >> /var/log/user-data.log
 ```
 
 ## Option 2: AWS CloudFormation Template
@@ -480,6 +916,26 @@ Parameters:
   PrivateSubnetIds:
     Type: List<AWS::EC2::Subnet::Id>
     Description: List of private subnet IDs for EC2 instances (minimum 2 required)
+  
+  RdsSnapshotIdentifier:
+    Type: String
+    Description: Identifier of the RDS snapshot to restore from
+  
+  DatabasePassword:
+    Type: String
+    NoEcho: true
+    Description: Master password for the database
+    MinLength: 8
+  
+  DatabaseUsername:
+    Type: String
+    Default: admin
+    Description: Master username for the database
+  
+  DatabaseName:
+    Type: String
+    Default: myapp
+    Description: Name of the database
 
 Resources:
 
@@ -519,6 +975,51 @@ Resources:
       Tags:
         - Key: Name
           Value: !Sub '${ProjectName}-ec2-sg'
+
+  # Security Group for RDS Aurora
+  RDSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for RDS Aurora cluster
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref EC2SecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-rds-sg'
+
+  # Security Group for ElastiCache
+  ElastiCacheSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for ElastiCache Redis cluster
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 6379
+          ToPort: 6379
+          SourceSecurityGroupId: !Ref EC2SecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-elasticache-sg'
+
+  # Security Group for EFS
+  EFSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for EFS file system
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          SourceSecurityGroupId: !Ref EC2SecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-efs-sg'
 
   # Application Load Balancer
   ApplicationLoadBalancer:
@@ -698,6 +1199,150 @@ Resources:
       TargetId: !Ref ManualInstance2
       Port: 80
 
+  # RDS Subnet Group
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Subnet group for RDS Aurora cluster
+      SubnetIds: !Ref PrivateSubnetIds
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-db-subnet-group'
+
+  # Aurora RDS Cluster from Snapshot
+  AuroraCluster:
+    Type: AWS::RDS::DBCluster
+    Properties:
+      DBClusterIdentifier: !Sub '${ProjectName}-aurora-cluster'
+      Engine: aurora-mysql
+      EngineVersion: 8.0.mysql_aurora.3.02.0
+      DatabaseName: !Ref DatabaseName
+      MasterUsername: !Ref DatabaseUsername
+      MasterUserPassword: !Ref DatabasePassword
+      BackupRetentionPeriod: 7
+      PreferredBackupWindow: "07:00-09:00"
+      PreferredMaintenanceWindow: "sun:05:00-sun:06:00"
+      SnapshotIdentifier: !Ref RdsSnapshotIdentifier
+      VpcSecurityGroupIds:
+        - !Ref RDSSecurityGroup
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      StorageEncrypted: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-aurora-cluster'
+
+  # Aurora RDS Instance 1
+  AuroraInstance1:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceIdentifier: !Sub '${ProjectName}-aurora-instance-1'
+      DBClusterIdentifier: !Ref AuroraCluster
+      DBInstanceClass: db.r6g.large
+      Engine: aurora-mysql
+      PerformanceInsightsEnabled: true
+      MonitoringInterval: 60
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-aurora-instance-1'
+
+  # Aurora RDS Instance 2
+  AuroraInstance2:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceIdentifier: !Sub '${ProjectName}-aurora-instance-2'
+      DBClusterIdentifier: !Ref AuroraCluster
+      DBInstanceClass: db.r6g.large
+      Engine: aurora-mysql
+      PerformanceInsightsEnabled: true
+      MonitoringInterval: 60
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-aurora-instance-2'
+
+  # ElastiCache Subnet Group
+  CacheSubnetGroup:
+    Type: AWS::ElastiCache::SubnetGroup
+    Properties:
+      Description: Subnet group for ElastiCache Redis cluster
+      SubnetIds: !Ref PrivateSubnetIds
+      CacheSubnetGroupName: !Sub '${ProjectName}-cache-subnet-group'
+
+  # ElastiCache Redis Replication Group
+  RedisReplicationGroup:
+    Type: AWS::ElastiCache::ReplicationGroup
+    Properties:
+      ReplicationGroupId: !Sub '${ProjectName}-redis'
+      ReplicationGroupDescription: !Sub 'Redis cluster for ${ProjectName}'
+      NodeType: cache.r6g.large
+      Port: 6379
+      CacheParameterGroupName: default.redis7
+      NumCacheClusters: 2
+      Engine: redis
+      EngineVersion: 7.0
+      CacheSubnetGroupName: !Ref CacheSubnetGroup
+      SecurityGroupIds:
+        - !Ref ElastiCacheSecurityGroup
+      AtRestEncryptionEnabled: true
+      TransitEncryptionEnabled: true
+      PreferredMaintenanceWindow: "sun:05:00-sun:06:00"
+      SnapshotRetentionLimit: 5
+      SnapshotWindow: "03:00-05:00"
+      AutomaticFailoverEnabled: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-redis'
+
+  # EFS File System
+  EFSFileSystem:
+    Type: AWS::EFS::FileSystem
+    Properties:
+      CreationToken: !Sub '${ProjectName}-efs'
+      PerformanceMode: generalPurpose
+      ThroughputMode: provisioned
+      ProvisionedThroughputInMibps: 100
+      Encrypted: true
+      LifecyclePolicyTransitionToIA: AFTER_30_DAYS
+      LifecyclePolicyTransitionToPrimaryStorageClass: AFTER_1_ACCESS
+      FileSystemTags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-efs'
+
+  # EFS Mount Target 1
+  EFSMountTarget1:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref EFSFileSystem
+      SubnetId: !Select [0, !Ref PrivateSubnetIds]
+      SecurityGroups:
+        - !Ref EFSSecurityGroup
+
+  # EFS Mount Target 2
+  EFSMountTarget2:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref EFSFileSystem
+      SubnetId: !Select [1, !Ref PrivateSubnetIds]
+      SecurityGroups:
+        - !Ref EFSSecurityGroup
+
+  # EFS Access Point
+  EFSAccessPoint:
+    Type: AWS::EFS::AccessPoint
+    Properties:
+      FileSystemId: !Ref EFSFileSystem
+      PosixUser:
+        Uid: 1001
+        Gid: 1001
+      RootDirectory:
+        Path: "/app"
+        CreationInfo:
+          OwnerUid: 1001
+          OwnerGid: 1001
+          Permissions: "755"
+      AccessPointTags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-efs-access-point'
+
 Outputs:
   LoadBalancerDNS:
     Description: DNS name of the load balancer
@@ -716,6 +1361,42 @@ Outputs:
     Value: !Ref AutoScalingGroup
     Export:
       Name: !Sub '${ProjectName}-AutoScalingGroupName'
+
+  AuroraClusterEndpoint:
+    Description: Aurora cluster endpoint
+    Value: !GetAtt AuroraCluster.Endpoint.Address
+    Export:
+      Name: !Sub '${ProjectName}-AuroraClusterEndpoint'
+
+  AuroraClusterReaderEndpoint:
+    Description: Aurora cluster reader endpoint
+    Value: !GetAtt AuroraCluster.ReadEndpoint.Address
+    Export:
+      Name: !Sub '${ProjectName}-AuroraClusterReaderEndpoint'
+
+  RedisClusterEndpoint:
+    Description: Redis cluster endpoint
+    Value: !GetAtt RedisReplicationGroup.ConfigurationEndPoint.Address
+    Export:
+      Name: !Sub '${ProjectName}-RedisClusterEndpoint'
+
+  RedisClusterPort:
+    Description: Redis cluster port
+    Value: !GetAtt RedisReplicationGroup.ConfigurationEndPoint.Port
+    Export:
+      Name: !Sub '${ProjectName}-RedisClusterPort'
+
+  EFSFileSystemId:
+    Description: EFS file system ID
+    Value: !Ref EFSFileSystem
+    Export:
+      Name: !Sub '${ProjectName}-EFSFileSystemId'
+
+  EFSAccessPointId:
+    Description: EFS access point ID
+    Value: !Ref EFSAccessPoint
+    Export:
+      Name: !Sub '${ProjectName}-EFSAccessPointId'
 ```
 
 ## Option 3: AWS CLI Commands
@@ -1015,7 +1696,13 @@ rm user-data.txt
 aws cloudformation create-stack \
     --stack-name asg-elb-setup \
     --template-body file://asg-elb-cloudformation.yaml \
-    --parameters ParameterKey=KeyPairName,ParameterValue=your-key-pair-name
+    --parameters \
+        ParameterKey=KeyPairName,ParameterValue=your-key-pair-name \
+        ParameterKey=VpcId,ParameterValue=vpc-1234567890abcdef0 \
+        ParameterKey=PublicSubnetIds,ParameterValue="subnet-1234567890abcdef0,subnet-0987654321fedcba0" \
+        ParameterKey=PrivateSubnetIds,ParameterValue="subnet-abcdef1234567890a,subnet-fedcba0987654321b" \
+        ParameterKey=RdsSnapshotIdentifier,ParameterValue=aurora-cluster-snapshot-2024-01-01 \
+        ParameterKey=DatabasePassword,ParameterValue=YourSecurePassword123!
 ```
 
 ### For AWS CLI:
