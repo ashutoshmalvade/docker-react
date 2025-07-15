@@ -1734,6 +1734,89 @@ After deployment, verify your setup:
    aws elbv2 describe-target-group-attributes --target-group-arn <TARGET_GROUP_ARN>
    ```
 
+5. **Check Aurora RDS cluster status**:
+   ```bash
+   aws rds describe-db-clusters --db-cluster-identifier <CLUSTER_NAME>
+   ```
+
+6. **Check ElastiCache Redis cluster status**:
+   ```bash
+   aws elasticache describe-replication-groups --replication-group-id <REDIS_GROUP_ID>
+   ```
+
+7. **Check EFS file system status**:
+   ```bash
+   aws efs describe-file-systems --file-system-id <EFS_ID>
+   ```
+
+## Testing Service Connectivity
+
+### Test Database Connection (from EC2 instance):
+```bash
+# SSH into one of your EC2 instances
+ssh -i your-key.pem ec2-user@<INSTANCE_IP>
+
+# Test MySQL connection to Aurora
+mysql -h <AURORA_ENDPOINT> -u admin -p
+```
+
+### Test Redis Connection (from EC2 instance):
+```bash
+# Install redis-cli if not already installed
+sudo yum install -y redis
+
+# Test Redis connection
+redis-cli -h <REDIS_ENDPOINT> -p 6379 ping
+```
+
+### Test EFS Mount (from EC2 instance):
+```bash
+# Check if EFS is mounted
+df -h | grep efs
+
+# Test write to EFS
+echo "Hello EFS" > /mnt/efs/test.txt
+cat /mnt/efs/test.txt
+
+# List files in shared directory
+ls -la /mnt/efs/app/
+```
+
+### Application Example - Using All Services:
+```bash
+# Create a simple application script on EC2
+cat > /home/ec2-user/test-services.sh << 'EOF'
+#!/bin/bash
+
+echo "=== Testing Complete Infrastructure ==="
+
+# Test Aurora MySQL
+echo "1. Testing Aurora MySQL connection..."
+mysql -h $AURORA_ENDPOINT -u admin -p$DB_PASSWORD -e "SELECT VERSION();" 2>/dev/null && echo "✅ Aurora MySQL: Connected" || echo "❌ Aurora MySQL: Failed"
+
+# Test Redis
+echo "2. Testing Redis connection..."
+redis-cli -h $REDIS_ENDPOINT -p 6379 ping 2>/dev/null && echo "✅ Redis: Connected" || echo "❌ Redis: Failed"
+
+# Test EFS
+echo "3. Testing EFS mount..."
+[ -d "/mnt/efs" ] && echo "✅ EFS: Mounted" || echo "❌ EFS: Not mounted"
+
+# Test writing to EFS
+echo "4. Testing EFS write access..."
+echo "Test $(date)" > /mnt/efs/test-$(hostname).txt 2>/dev/null && echo "✅ EFS: Write successful" || echo "❌ EFS: Write failed"
+
+# Show instance info
+echo "5. Instance Information:"
+echo "   Instance ID: $(curl -s http://169.254.169.254/latest/meta-data/instance-id)"
+echo "   AZ: $(curl -s http://169.254.169.254/latest/meta-data/placement/availability-zone)"
+
+echo "=== Test Complete ==="
+EOF
+
+chmod +x /home/ec2-user/test-services.sh
+```
+
 ## Managing the Setup
 
 ### Scale the Auto Scaling Group:
@@ -1756,6 +1839,69 @@ aws elbv2 register-targets \
     --targets Id=<INSTANCE_ID>,Port=80
 ```
 
+### Manage Aurora RDS Cluster:
+```bash
+# Scale Aurora cluster (add instance)
+aws rds create-db-instance \
+    --db-instance-identifier my-aurora-instance-3 \
+    --db-cluster-identifier <CLUSTER_IDENTIFIER> \
+    --db-instance-class db.r6g.large \
+    --engine aurora-mysql
+
+# Create Aurora snapshot
+aws rds create-db-cluster-snapshot \
+    --db-cluster-snapshot-identifier my-aurora-snapshot-$(date +%Y%m%d) \
+    --db-cluster-identifier <CLUSTER_IDENTIFIER>
+
+# Modify Aurora cluster
+aws rds modify-db-cluster \
+    --db-cluster-identifier <CLUSTER_IDENTIFIER> \
+    --backup-retention-period 14 \
+    --apply-immediately
+```
+
+### Manage ElastiCache Redis:
+```bash
+# Scale Redis cluster (add node)
+aws elasticache modify-replication-group \
+    --replication-group-id <REDIS_GROUP_ID> \
+    --num-cache-clusters 3 \
+    --apply-immediately
+
+# Create Redis backup
+aws elasticache create-snapshot \
+    --cache-cluster-id <CACHE_CLUSTER_ID> \
+    --snapshot-name redis-backup-$(date +%Y%m%d)
+
+# Get Redis logs
+aws elasticache describe-events \
+    --source-identifier <REDIS_GROUP_ID> \
+    --source-type replication-group
+```
+
+### Manage EFS:
+```bash
+# Modify EFS throughput
+aws efs modify-file-system \
+    --file-system-id <EFS_ID> \
+    --provisioned-throughput-in-mibps 200
+
+# Create EFS backup
+aws efs put-backup-policy \
+    --file-system-id <EFS_ID> \
+    --backup-policy Status=ENABLED
+
+# Monitor EFS performance
+aws cloudwatch get-metric-statistics \
+    --namespace AWS/EFS \
+    --metric-name TotalIOBytes \
+    --dimensions Name=FileSystemId,Value=<EFS_ID> \
+    --start-time $(date -u -d '1 hour ago' +%Y-%m-%dT%H:%M:%S) \
+    --end-time $(date -u +%Y-%m-%dT%H:%M:%S) \
+    --period 3600 \
+    --statistics Sum
+```
+
 ## Cleanup
 
 ### Terraform:
@@ -1770,20 +1916,120 @@ aws cloudformation delete-stack --stack-name asg-elb-setup
 
 ### Manual cleanup (if using CLI):
 ```bash
-# Remove instances from target group
-aws elbv2 deregister-targets --target-group-arn <TARGET_GROUP_ARN> --targets Id=<INSTANCE_ID>,Port=80
+#!/bin/bash
+# Complete infrastructure cleanup script
 
-# Terminate manual instances
-aws ec2 terminate-instances --instance-ids <INSTANCE_ID_1> <INSTANCE_ID_2>
+echo "Starting cleanup process..."
 
-# Delete Auto Scaling Group
-aws autoscaling delete-auto-scaling-group --auto-scaling-group-name asg-elb-setup-asg --force-delete
+# 1. Remove manual instances from target group
+echo "Removing manual instances from target group..."
+aws elbv2 deregister-targets --target-group-arn <TARGET_GROUP_ARN> --targets Id=<MANUAL_INSTANCE_1>,Port=80
+aws elbv2 deregister-targets --target-group-arn <TARGET_GROUP_ARN> --targets Id=<MANUAL_INSTANCE_2>,Port=80
 
-# Delete other resources in reverse order...
+# 2. Delete Auto Scaling Group (this will terminate ASG instances)
+echo "Deleting Auto Scaling Group..."
+aws autoscaling delete-auto-scaling-group --auto-scaling-group-name <ASG_NAME> --force-delete
+
+# 3. Wait for ASG deletion and then delete launch template
+echo "Waiting for ASG deletion to complete..."
+sleep 60
+aws ec2 delete-launch-template --launch-template-id <LAUNCH_TEMPLATE_ID>
+
+# 4. Terminate manual EC2 instances
+echo "Terminating manual instances..."
+aws ec2 terminate-instances --instance-ids <MANUAL_INSTANCE_1> <MANUAL_INSTANCE_2>
+
+# 5. Delete EFS resources
+echo "Deleting EFS resources..."
+aws efs delete-access-point --access-point-id <EFS_ACCESS_POINT_ID>
+aws efs delete-mount-target --mount-target-id <MOUNT_TARGET_1>
+aws efs delete-mount-target --mount-target-id <MOUNT_TARGET_2>
+sleep 30  # Wait for mount targets to be deleted
+aws efs delete-file-system --file-system-id <EFS_ID>
+
+# 6. Delete ElastiCache Redis cluster
+echo "Deleting ElastiCache Redis cluster..."
+aws elasticache delete-replication-group \
+    --replication-group-id <REDIS_GROUP_ID> \
+    --no-retain-primary-cluster
+
+# Delete cache subnet group
+aws elasticache delete-cache-subnet-group --cache-subnet-group-name <CACHE_SUBNET_GROUP>
+
+# 7. Delete Aurora RDS cluster
+echo "Deleting Aurora RDS cluster..."
+# Delete instances first
+aws rds delete-db-instance \
+    --db-instance-identifier <AURORA_INSTANCE_1> \
+    --skip-final-snapshot
+
+aws rds delete-db-instance \
+    --db-instance-identifier <AURORA_INSTANCE_2> \
+    --skip-final-snapshot
+
+# Wait for instances to be deleted
+echo "Waiting for RDS instances to be deleted..."
+sleep 300
+
+# Delete cluster
+aws rds delete-db-cluster \
+    --db-cluster-identifier <AURORA_CLUSTER> \
+    --skip-final-snapshot
+
+# Delete DB subnet group
+aws rds delete-db-subnet-group --db-subnet-group-name <DB_SUBNET_GROUP>
+
+# 8. Delete Load Balancer components
+echo "Deleting load balancer resources..."
+aws elbv2 delete-listener --listener-arn <LISTENER_ARN>
+aws elbv2 delete-target-group --target-group-arn <TARGET_GROUP_ARN>
+aws elbv2 delete-load-balancer --load-balancer-arn <ALB_ARN>
+
+# 9. Delete Security Groups (wait for dependencies to be removed first)
+echo "Waiting for resources to be fully deleted before removing security groups..."
+sleep 120
+
+aws ec2 delete-security-group --group-id <EFS_SG_ID>
+aws ec2 delete-security-group --group-id <ELASTICACHE_SG_ID>
+aws ec2 delete-security-group --group-id <RDS_SG_ID>
+aws ec2 delete-security-group --group-id <EC2_SG_ID>
+aws ec2 delete-security-group --group-id <ALB_SG_ID>
+
+echo "Cleanup completed!"
+```
+
+### Cost Optimization Tips:
+```bash
+# Stop Aurora cluster (if you want to preserve data but save costs)
+aws rds stop-db-cluster --db-cluster-identifier <CLUSTER_IDENTIFIER>
+
+# Reduce EFS provisioned throughput during low usage
+aws efs modify-file-system \
+    --file-system-id <EFS_ID> \
+    --provisioned-throughput-in-mibps 50
+
+# Scale down Auto Scaling Group during off hours
+aws autoscaling set-desired-capacity \
+    --auto-scaling-group-name <ASG_NAME> \
+    --desired-capacity 2
+
+# Create scheduled scaling for regular patterns
+aws autoscaling create-scheduled-action \
+    --auto-scaling-group-name <ASG_NAME> \
+    --scheduled-action-name "scale-down-evening" \
+    --schedule "0 22 * * *" \
+    --desired-capacity 2
+
+aws autoscaling create-scheduled-action \
+    --auto-scaling-group-name <ASG_NAME> \
+    --scheduled-action-name "scale-up-morning" \
+    --schedule "0 8 * * 1-5" \
+    --desired-capacity 4
 ```
 
 ## Best Practices
 
+### General Infrastructure:
 1. **Use Launch Templates** instead of Launch Configurations (deprecated)
 2. **Enable detailed monitoring** for better scaling decisions
 3. **Configure proper health checks** for your application
@@ -1793,4 +2039,76 @@ aws autoscaling delete-auto-scaling-group --auto-scaling-group-name asg-elb-setu
 7. **Enable encryption** for EBS volumes and load balancer traffic
 8. **Regular security updates** through automated patching
 
-This setup provides a robust, scalable infrastructure with 4 Auto Scaling Group instances and 2 manual instances all serving traffic through a single Application Load Balancer.
+### Aurora RDS Best Practices:
+1. **Enable automated backups** with appropriate retention period
+2. **Use read replicas** for read-heavy workloads
+3. **Enable Performance Insights** for query optimization
+4. **Set up monitoring** for CPU, connections, and storage
+5. **Use parameter groups** for custom database configurations
+6. **Enable encryption at rest** for sensitive data
+7. **Regular security patches** through maintenance windows
+8. **Test disaster recovery** procedures regularly
+
+### ElastiCache Redis Best Practices:
+1. **Enable cluster mode** for high availability and scaling
+2. **Use appropriate node types** for your workload
+3. **Enable encryption** in transit and at rest
+4. **Monitor memory usage** and eviction policies
+5. **Set up CloudWatch alarms** for key metrics
+6. **Use connection pooling** from applications
+7. **Regular snapshots** for data persistence
+8. **Test failover scenarios** periodically
+
+### EFS Best Practices:
+1. **Use provisioned throughput** for consistent performance
+2. **Enable lifecycle policies** to optimize costs
+3. **Monitor performance metrics** and adjust throughput
+4. **Use EFS access points** for application-specific access
+5. **Enable backup policies** for data protection
+6. **Use VPC endpoints** for private connectivity
+7. **Implement proper file permissions** and access controls
+8. **Monitor file system utilization** and growth
+
+### Security Best Practices:
+1. **Use VPC security groups** with least privilege access
+2. **Enable VPC Flow Logs** for network monitoring
+3. **Use AWS Secrets Manager** for database credentials
+4. **Implement network ACLs** for additional security layers
+5. **Enable AWS Config** for compliance monitoring
+6. **Use AWS CloudTrail** for API audit logging
+7. **Regular security assessments** and vulnerability scans
+8. **Implement WAF** for application layer protection
+
+### Cost Optimization:
+1. **Use Spot Instances** for non-critical workloads in ASG
+2. **Implement scheduled scaling** for predictable patterns
+3. **Monitor and optimize** EFS and RDS storage usage
+4. **Use Reserved Instances** for long-term workloads
+5. **Enable Cost Explorer** and billing alerts
+6. **Regular cost reviews** and resource optimization
+7. **Use AWS Trusted Advisor** recommendations
+8. **Implement resource tagging** for cost allocation
+
+## Architecture Summary
+
+This comprehensive setup provides:
+
+- **High Availability**: Multi-AZ deployment across all services
+- **Scalability**: Auto Scaling Group with manual instances for flexibility
+- **Performance**: 
+  - Aurora MySQL for high-performance database operations
+  - ElastiCache Redis for sub-millisecond caching
+  - EFS with provisioned throughput for consistent file system performance
+- **Security**: Network isolation with security groups and encryption
+- **Monitoring**: CloudWatch integration across all services
+- **Cost Optimization**: Flexible scaling and resource management
+
+**Total Infrastructure Components:**
+- ✅ 4 Auto Scaling Group EC2 instances
+- ✅ 2 Manual EC2 instances  
+- ✅ Application Load Balancer with target group
+- ✅ Aurora MySQL cluster (2 instances)
+- ✅ ElastiCache Redis cluster (2 nodes)
+- ✅ EFS file system with provisioned throughput
+- ✅ Security groups and networking
+- ✅ CloudWatch monitoring and auto-scaling policies
