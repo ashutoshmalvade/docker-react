@@ -1,24 +1,27 @@
 # AWS Auto Scaling Group with ELB and Additional EC2 Instances Setup Guide
 
-This guide demonstrates how to create an AWS Auto Scaling Group (ASG) with 4 EC2 instances connected to an Application Load Balancer (ALB), plus 2 additional standalone EC2 instances added to the same target group.
+This guide demonstrates how to create an AWS Auto Scaling Group (ASG) with 4 EC2 instances connected to an Application Load Balancer (ALB), plus 2 additional standalone EC2 instances added to the same target group using existing VPC infrastructure.
 
 ## Architecture Overview
 
 ```
-Internet Gateway
+Existing VPC
        |
-Application Load Balancer
+Application Load Balancer (Public Subnets)
        |
 Target Group
    /       \
 ASG (4 instances)  +  Manual EC2 (2 instances)
+      (Private Subnets)
 ```
 
 ## Prerequisites
 
 - AWS CLI configured with appropriate permissions
 - Terraform installed (for Terraform approach)
-- Valid AWS account with VPC, subnets, and security groups
+- **Existing VPC with public and private subnets**
+- **Internet Gateway attached to VPC**
+- **Route tables configured for public subnets**
 
 ## Option 1: Terraform Implementation
 
@@ -48,9 +51,19 @@ provider "aws" {
   region = var.aws_region
 }
 
-# Data sources
-data "aws_availability_zones" "available" {
-  state = "available"
+# Data sources for existing infrastructure
+data "aws_vpc" "existing" {
+  id = var.vpc_id
+}
+
+data "aws_subnet" "public" {
+  count = length(var.public_subnet_ids)
+  id    = var.public_subnet_ids[count.index]
+}
+
+data "aws_subnet" "private" {
+  count = length(var.private_subnet_ids)
+  id    = var.private_subnet_ids[count.index]
 }
 
 data "aws_ami" "amazon_linux" {
@@ -63,76 +76,11 @@ data "aws_ami" "amazon_linux" {
   }
 }
 
-# VPC Configuration
-resource "aws_vpc" "main" {
-  cidr_block           = var.vpc_cidr
-  enable_dns_hostnames = true
-  enable_dns_support   = true
-  
-  tags = {
-    Name = "${var.project_name}-vpc"
-  }
-}
-
-resource "aws_internet_gateway" "main" {
-  vpc_id = aws_vpc.main.id
-  
-  tags = {
-    Name = "${var.project_name}-igw"
-  }
-}
-
-# Public Subnets
-resource "aws_subnet" "public" {
-  count             = 2
-  vpc_id            = aws_vpc.main.id
-  cidr_block        = var.public_subnet_cidrs[count.index]
-  availability_zone = data.aws_availability_zones.available.names[count.index]
-  
-  map_public_ip_on_launch = true
-  
-  tags = {
-    Name = "${var.project_name}-public-subnet-${count.index + 1}"
-  }
-}
-
-# Private Subnets
-resource "aws_subnet" "private" {
-  count             = 2
-  vpc_id            = aws_vpc.main.id
-  cidr_block        = var.private_subnet_cidrs[count.index]
-  availability_zone = data.aws_availability_zones.available.names[count.index]
-  
-  tags = {
-    Name = "${var.project_name}-private-subnet-${count.index + 1}"
-  }
-}
-
-# Route Tables
-resource "aws_route_table" "public" {
-  vpc_id = aws_vpc.main.id
-  
-  route {
-    cidr_block = "0.0.0.0/0"
-    gateway_id = aws_internet_gateway.main.id
-  }
-  
-  tags = {
-    Name = "${var.project_name}-public-rt"
-  }
-}
-
-resource "aws_route_table_association" "public" {
-  count          = 2
-  subnet_id      = aws_subnet.public[count.index].id
-  route_table_id = aws_route_table.public.id
-}
-
 # Security Groups
 resource "aws_security_group" "alb" {
   name        = "${var.project_name}-alb-sg"
   description = "Security group for Application Load Balancer"
-  vpc_id      = aws_vpc.main.id
+  vpc_id      = data.aws_vpc.existing.id
   
   ingress {
     from_port   = 80
@@ -163,7 +111,7 @@ resource "aws_security_group" "alb" {
 resource "aws_security_group" "ec2" {
   name        = "${var.project_name}-ec2-sg"
   description = "Security group for EC2 instances"
-  vpc_id      = aws_vpc.main.id
+  vpc_id      = data.aws_vpc.existing.id
   
   ingress {
     from_port       = 80
@@ -176,7 +124,7 @@ resource "aws_security_group" "ec2" {
     from_port   = 22
     to_port     = 22
     protocol    = "tcp"
-    cidr_blocks = [var.vpc_cidr]
+    cidr_blocks = [data.aws_vpc.existing.cidr_block]
   }
   
   egress {
@@ -197,7 +145,7 @@ resource "aws_lb" "main" {
   internal           = false
   load_balancer_type = "application"
   security_groups    = [aws_security_group.alb.id]
-  subnets            = aws_subnet.public[*].id
+  subnets            = var.public_subnet_ids
   
   enable_deletion_protection = false
   
@@ -211,7 +159,7 @@ resource "aws_lb_target_group" "main" {
   name     = "${var.project_name}-tg"
   port     = 80
   protocol = "HTTP"
-  vpc_id   = aws_vpc.main.id
+  vpc_id   = data.aws_vpc.existing.id
   
   health_check {
     enabled             = true
@@ -271,7 +219,7 @@ resource "aws_launch_template" "main" {
 # Auto Scaling Group
 resource "aws_autoscaling_group" "main" {
   name                = "${var.project_name}-asg"
-  vpc_zone_identifier = aws_subnet.private[*].id
+  vpc_zone_identifier = var.private_subnet_ids
   target_group_arns   = [aws_lb_target_group.main.arn]
   health_check_type   = "ELB"
   health_check_grace_period = 300
@@ -281,7 +229,7 @@ resource "aws_autoscaling_group" "main" {
   desired_capacity = 4
   
   launch_template {
-    id      = aws_launch_template.launch_template.id
+    id      = aws_launch_template.main.id
     version = "$Latest"
   }
   
@@ -302,7 +250,7 @@ resource "aws_instance" "manual" {
   ami                    = data.aws_ami.amazon_linux.id
   instance_type          = var.instance_type
   key_name               = var.key_pair_name
-  subnet_id              = aws_subnet.private[count.index % 2].id
+  subnet_id              = var.private_subnet_ids[count.index % length(var.private_subnet_ids)]
   vpc_security_group_ids = [aws_security_group.ec2.id]
   
   user_data = file("user-data.sh")
@@ -387,22 +335,31 @@ variable "project_name" {
   default     = "asg-elb-setup"
 }
 
-variable "vpc_cidr" {
-  description = "CIDR block for VPC"
+variable "vpc_id" {
+  description = "ID of existing VPC"
   type        = string
-  default     = "10.0.0.0/16"
+  validation {
+    condition     = can(regex("^vpc-", var.vpc_id))
+    error_message = "VPC ID must be a valid VPC identifier starting with 'vpc-'."
+  }
 }
 
-variable "public_subnet_cidrs" {
-  description = "CIDR blocks for public subnets"
+variable "public_subnet_ids" {
+  description = "List of public subnet IDs for ALB"
   type        = list(string)
-  default     = ["10.0.1.0/24", "10.0.2.0/24"]
+  validation {
+    condition     = length(var.public_subnet_ids) >= 2
+    error_message = "At least 2 public subnet IDs are required for ALB."
+  }
 }
 
-variable "private_subnet_cidrs" {
-  description = "CIDR blocks for private subnets"
+variable "private_subnet_ids" {
+  description = "List of private subnet IDs for EC2 instances"
   type        = list(string)
-  default     = ["10.0.3.0/24", "10.0.4.0/24"]
+  validation {
+    condition     = length(var.private_subnet_ids) >= 2
+    error_message = "At least 2 private subnet IDs are required for high availability."
+  }
 }
 
 variable "instance_type" {
@@ -414,8 +371,24 @@ variable "instance_type" {
 variable "key_pair_name" {
   description = "Name of the AWS key pair"
   type        = string
-  default     = ""
 }
+```
+
+### terraform.tfvars (example)
+```hcl
+# Update these values with your existing infrastructure
+vpc_id = "vpc-1234567890abcdef0"
+public_subnet_ids = [
+  "subnet-1234567890abcdef0",  # Public subnet in AZ1
+  "subnet-0987654321fedcba0"   # Public subnet in AZ2
+]
+private_subnet_ids = [
+  "subnet-abcdef1234567890a",  # Private subnet in AZ1
+  "subnet-fedcba0987654321b"   # Private subnet in AZ2
+]
+key_pair_name = "my-key-pair"
+project_name = "my-asg-elb"
+aws_region = "us-east-1"
 ```
 
 ### outputs.tf
@@ -442,7 +415,7 @@ output "manual_instance_ids" {
 
 output "vpc_id" {
   description = "ID of the VPC"
-  value       = aws_vpc.main.id
+  value       = data.aws_vpc.existing.id
 }
 ```
 
@@ -479,7 +452,7 @@ systemctl restart httpd
 ### asg-elb-cloudformation.yaml
 ```yaml
 AWSTemplateFormatVersion: '2010-09-09'
-Description: 'Auto Scaling Group with 4 instances + 2 manual instances behind ALB'
+Description: 'Auto Scaling Group with 4 instances + 2 manual instances behind ALB using existing VPC'
 
 Parameters:
   ProjectName:
@@ -495,111 +468,27 @@ Parameters:
   KeyPairName:
     Type: AWS::EC2::KeyPair::KeyName
     Description: Name of an existing EC2 KeyPair
+  
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: ID of existing VPC
+  
+  PublicSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: List of public subnet IDs for ALB (minimum 2 required)
+  
+  PrivateSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: List of private subnet IDs for EC2 instances (minimum 2 required)
 
 Resources:
-  # VPC Configuration
-  VPC:
-    Type: AWS::EC2::VPC
-    Properties:
-      CidrBlock: 10.0.0.0/16
-      EnableDnsHostnames: true
-      EnableDnsSupport: true
-      Tags:
-        - Key: Name
-          Value: !Sub '${ProjectName}-vpc'
-
-  InternetGateway:
-    Type: AWS::EC2::InternetGateway
-    Properties:
-      Tags:
-        - Key: Name
-          Value: !Sub '${ProjectName}-igw'
-
-  AttachGateway:
-    Type: AWS::EC2::VPCGatewayAttachment
-    Properties:
-      VpcId: !Ref VPC
-      InternetGatewayId: !Ref InternetGateway
-
-  # Public Subnets
-  PublicSubnet1:
-    Type: AWS::EC2::Subnet
-    Properties:
-      VpcId: !Ref VPC
-      CidrBlock: 10.0.1.0/24
-      AvailabilityZone: !Select [0, !GetAZs '']
-      MapPublicIpOnLaunch: true
-      Tags:
-        - Key: Name
-          Value: !Sub '${ProjectName}-public-subnet-1'
-
-  PublicSubnet2:
-    Type: AWS::EC2::Subnet
-    Properties:
-      VpcId: !Ref VPC
-      CidrBlock: 10.0.2.0/24
-      AvailabilityZone: !Select [1, !GetAZs '']
-      MapPublicIpOnLaunch: true
-      Tags:
-        - Key: Name
-          Value: !Sub '${ProjectName}-public-subnet-2'
-
-  # Private Subnets
-  PrivateSubnet1:
-    Type: AWS::EC2::Subnet
-    Properties:
-      VpcId: !Ref VPC
-      CidrBlock: 10.0.3.0/24
-      AvailabilityZone: !Select [0, !GetAZs '']
-      Tags:
-        - Key: Name
-          Value: !Sub '${ProjectName}-private-subnet-1'
-
-  PrivateSubnet2:
-    Type: AWS::EC2::Subnet
-    Properties:
-      VpcId: !Ref VPC
-      CidrBlock: 10.0.4.0/24
-      AvailabilityZone: !Select [1, !GetAZs '']
-      Tags:
-        - Key: Name
-          Value: !Sub '${ProjectName}-private-subnet-2'
-
-  # Route Tables
-  PublicRouteTable:
-    Type: AWS::EC2::RouteTable
-    Properties:
-      VpcId: !Ref VPC
-      Tags:
-        - Key: Name
-          Value: !Sub '${ProjectName}-public-rt'
-
-  PublicRoute:
-    Type: AWS::EC2::Route
-    DependsOn: AttachGateway
-    Properties:
-      RouteTableId: !Ref PublicRouteTable
-      DestinationCidrBlock: 0.0.0.0/0
-      GatewayId: !Ref InternetGateway
-
-  PublicSubnetRouteTableAssociation1:
-    Type: AWS::EC2::SubnetRouteTableAssociation
-    Properties:
-      SubnetId: !Ref PublicSubnet1
-      RouteTableId: !Ref PublicRouteTable
-
-  PublicSubnetRouteTableAssociation2:
-    Type: AWS::EC2::SubnetRouteTableAssociation
-    Properties:
-      SubnetId: !Ref PublicSubnet2
-      RouteTableId: !Ref PublicRouteTable
 
   # Security Groups
   ALBSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
       GroupDescription: Security group for Application Load Balancer
-      VpcId: !Ref VPC
+      VpcId: !Ref VpcId
       SecurityGroupIngress:
         - IpProtocol: tcp
           FromPort: 80
@@ -617,7 +506,7 @@ Resources:
     Type: AWS::EC2::SecurityGroup
     Properties:
       GroupDescription: Security group for EC2 instances
-      VpcId: !Ref VPC
+      VpcId: !Ref VpcId
       SecurityGroupIngress:
         - IpProtocol: tcp
           FromPort: 80
@@ -626,7 +515,7 @@ Resources:
         - IpProtocol: tcp
           FromPort: 22
           ToPort: 22
-          CidrIp: 10.0.0.0/16
+          CidrIp: 10.0.0.0/8  # Adjust this CIDR based on your VPC CIDR
       Tags:
         - Key: Name
           Value: !Sub '${ProjectName}-ec2-sg'
@@ -640,9 +529,7 @@ Resources:
       Type: application
       SecurityGroups:
         - !Ref ALBSecurityGroup
-      Subnets:
-        - !Ref PublicSubnet1
-        - !Ref PublicSubnet2
+      Subnets: !Ref PublicSubnetIds
       Tags:
         - Key: Name
           Value: !Sub '${ProjectName}-alb'
@@ -654,7 +541,7 @@ Resources:
       Name: !Sub '${ProjectName}-tg'
       Port: 80
       Protocol: HTTP
-      VpcId: !Ref VPC
+      VpcId: !Ref VpcId
       HealthCheckIntervalSeconds: 30
       HealthCheckPath: /
       HealthCheckProtocol: HTTP
