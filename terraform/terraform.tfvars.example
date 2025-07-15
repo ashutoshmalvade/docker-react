@@ -1,0 +1,24 @@
+# AWS Configuration
+aws_region = "us-west-2"
+
+# Project Configuration
+environment  = "dev"
+project_name = "my-autoscaling-app"
+
+# Network Configuration
+vpc_cidr               = "10.0.0.0/16"
+availability_zones     = ["us-west-2a", "us-west-2b"]
+public_subnet_cidrs    = ["10.0.1.0/24", "10.0.2.0/24"]
+private_subnet_cidrs   = ["10.0.10.0/24", "10.0.20.0/24"]
+
+# EC2 Configuration
+instance_type = "t3.micro"
+
+# Auto Scaling Configuration
+min_size         = 1
+max_size         = 5
+desired_capacity = 2
+
+# Security Configuration
+key_pair_name        = "my-key-pair"  # Optional: Name of your AWS key pair
+allowed_cidr_blocks  = ["0.0.0.0/0"]  # Restrict this to your IP range for better security
